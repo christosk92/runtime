@@ -8846,6 +8846,20 @@ HRESULT CordbJITILFrame::GetReturnValueForILOffsetImpl(ULONG32 ILoffset, ICorDeb
     CordbType *pType = 0;
     IfFailRet(BuildInstantiationForCallsite(GetModule(), types, inst, &m_genericArgs, targetClass, genericSig));
     IfFailRet(CordbType::SigToType(GetModule(), &methodSig, &inst, &pType));
+
+    // Prefer using the JIT-reported VarLoc for the managed return value (a
+    // CALL_RETURN_ILNUM NativeVarInfo entry); this handles cases where the
+    // return value is not in the platform's default ABI register (for example,
+    // struct returns via a return buffer, or future ABIs that differ from the
+    // hard-coded register assumptions in GetReturnValueForType).  Fall back to
+    // the ABI-default register path when no such entry exists.
+    const ICorDebugInfo::NativeVarInfo *pReturnVarInfo = NULL;
+    if (SUCCEEDED(pCode->GetReturnValueLiveVarInfoImpl(currentOffset, ILoffset, &pReturnVarInfo)) &&
+        pReturnVarInfo != NULL)
+    {
+        return GetNativeVariable(pType, pReturnVarInfo, ppReturnValue);
+    }
+
     return GetReturnValueForType(pType, ppReturnValue);
 }
 

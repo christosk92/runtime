@@ -5852,6 +5852,15 @@ public:
     // Worker function for GetReturnValueLiveOffset.
     HRESULT GetReturnValueLiveOffsetImpl(Instantiation *currentInstantiation, ULONG32 ILoffset, ULONG32 bufferSize, ULONG32 *pFetched, ULONG32 *pOffsets);
 
+    // Find the CALL_RETURN_ILNUM NativeVarInfo entry (if any) that the JIT emitted
+    // for the call at the given IL offset whose return-value live range begins at
+    // the given native offset.  Returns S_OK and sets *ppNativeVarInfo on success;
+    // returns E_FAIL when no matching entry exists (e.g. older code that does not
+    // report managed-return-value debug info).
+    HRESULT GetReturnValueLiveVarInfoImpl(ULONG32 nativeOffset,
+                                          ULONG32 ILoffset,
+                                          const ICorDebugInfo::NativeVarInfo **ppNativeVarInfo);
+
     // get total size of the code including both hot and cold regions
     ULONG32 GetSize();
 

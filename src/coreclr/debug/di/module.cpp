@@ -4666,6 +4666,65 @@ HRESULT CordbNativeCode::GetReturnValueLiveOffsetImpl(Instantiation *currentInst
 }
 
 //-----------------------------------------------------------------------------
+// Look up the CALL_RETURN_ILNUM NativeVarInfo entry the JIT emitted for the call
+// at the given IL offset, whose return-value live range starts at the given
+// native offset.
+//
+// Arguments:
+//     nativeOffset    - native offset at which the debugger is currently stopped
+//                       (should correspond to the instruction immediately after
+//                       the call, where the return value first becomes live)
+//     ILoffset        - IL offset of the call instruction that produced the
+//                       return value
+//     ppNativeVarInfo - [out] receives a pointer to the matching NativeVarInfo
+//                       owned by m_nativeVarData; NULL when no match is found
+//
+// Return value:
+//     S_OK    - matching entry found, *ppNativeVarInfo set
+//     E_FAIL  - no matching entry exists
+//
+// Notes:
+//     The NativeVarInfo's VarLoc describes where the return value lives in
+//     registers/stack, allowing callers to read the actual return value rather
+//     than guessing at the platform's ABI default return register(s).
+//-----------------------------------------------------------------------------
+HRESULT CordbNativeCode::GetReturnValueLiveVarInfoImpl(ULONG32 nativeOffset,
+                                                       ULONG32 ILoffset,
+                                                       const ICorDebugInfo::NativeVarInfo **ppNativeVarInfo)
+{
+    _ASSERTE(ppNativeVarInfo != NULL);
+    *ppNativeVarInfo = NULL;
+
+    const DacDbiArrayList<ICorDebugInfo::NativeVarInfo> *pOffsetInfoList = m_nativeVarData.GetOffsetInfoList();
+    _ASSERTE(pOffsetInfoList != NULL);
+    for (unsigned int i = 0; i < pOffsetInfoList->Count(); i++)
+    {
+        const ICorDebugInfo::NativeVarInfo *pNativeVarInfo = &((*pOffsetInfoList)[i]);
+        _ASSERTE(pNativeVarInfo != NULL);
+
+        if (pNativeVarInfo->varNumber != ICorDebugInfo::CALL_RETURN_ILNUM)
+        {
+            continue;
+        }
+
+        if (pNativeVarInfo->callReturnValueILOffset != ILoffset)
+        {
+            continue;
+        }
+
+        if (pNativeVarInfo->startOffset != nativeOffset)
+        {
+            continue;
+        }
+
+        *ppNativeVarInfo = pNativeVarInfo;
+        return S_OK;
+    }
+
+    return E_FAIL;
+}
+
+//-----------------------------------------------------------------------------
 // Creates a CordbNativeCode (if it's not already created) and adds it to the
 // hash table of CordbNativeCode instances belonging to this module.
 // Used by CordbFunction::InitNativeCodeInfo.
