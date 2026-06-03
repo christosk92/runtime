@@ -4066,10 +4066,137 @@ public sealed unsafe partial class DacDbiImpl : IDacDbiInterface
     }
 
     public int ParseContinuation(ulong continuationAddress, ulong* pDiagnosticIP, ulong* pNextContinuation, uint* pState)
-        => LegacyFallbackHelper.CanFallback() && _legacy is not null ? _legacy.ParseContinuation(continuationAddress, pDiagnosticIP, pNextContinuation, pState) : HResults.E_NOTIMPL;
+    {
+        int hr = HResults.S_OK;
+        try
+        {
+            if (pDiagnosticIP is null || pNextContinuation is null || pState is null)
+                throw new ArgumentException("Output pointers must not be null.");
+
+            ContinuationInfo info = _target.Contracts.Object.GetContinuationInfo(new TargetPointer(continuationAddress));
+            // The native DAC dereferences pResumeInfo unconditionally; mirror its
+            // null-check behavior defensively -- the managed ResumeInfo struct
+            // documents that DiagnosticIP itself can be null (see AsyncHelpers.CoreCLR.cs).
+            TargetPointer diagnosticIP = _target.Contracts.Object.ReadResumeInfoDiagnosticIP(info.ResumeInfo);
+
+            *pDiagnosticIP = diagnosticIP.Value;
+            *pNextContinuation = info.Next.Value;
+            *pState = info.State;
+        }
+        catch (System.Exception ex)
+        {
+            hr = ex.HResult;
+        }
+#if DEBUG
+        if (_legacy is not null)
+        {
+            ulong diagnosticIPLocal;
+            ulong nextLocal;
+            uint stateLocal;
+            int hrLocal = _legacy.ParseContinuation(continuationAddress, &diagnosticIPLocal, &nextLocal, &stateLocal);
+            Debug.ValidateHResult(hr, hrLocal);
+            if (hr == HResults.S_OK)
+            {
+                Debug.Assert(*pDiagnosticIP == diagnosticIPLocal, $"cDAC: {*pDiagnosticIP:x}, DAC: {diagnosticIPLocal:x}");
+                Debug.Assert(*pNextContinuation == nextLocal, $"cDAC: {*pNextContinuation:x}, DAC: {nextLocal:x}");
+                Debug.Assert(*pState == stateLocal, $"cDAC: {*pState}, DAC: {stateLocal}");
+            }
+        }
+#endif
+        return hr;
+    }
 
     public int GetAsyncLocals(ulong vmMethod, ulong codeAddr, uint state, nint pAsyncLocals)
-        => LegacyFallbackHelper.CanFallback() && _legacy is not null ? _legacy.GetAsyncLocals(vmMethod, codeAddr, state, pAsyncLocals) : HResults.E_NOTIMPL;
+    {
+        int hr = HResults.S_OK;
+        try
+        {
+            if (vmMethod == 0)
+                throw new ArgumentException("vmMethod must not be zero.", nameof(vmMethod));
+            if (pAsyncLocals == 0)
+                throw new ArgumentException("pAsyncLocals must not be null.", nameof(pAsyncLocals));
+
+            Contracts.IRuntimeTypeSystem rts = _target.Contracts.RuntimeTypeSystem;
+            Contracts.MethodDescHandle md = rts.GetMethodDescHandle(new TargetPointer(vmMethod));
+
+            // Initialize the output list to empty up front so that early returns leave it well-defined.
+            Helpers.DacDbiArrayListMarshal.AllocAndAssign<Helpers.AsyncLocalData>(pAsyncLocals, 0);
+
+            // Mirrors native: async thunks do not have async debug info on the thunk itself.
+            if (rts.IsAsyncThunkMethod(md))
+                return hr;
+
+            TargetCodePointer pCode;
+            if (codeAddr != 0)
+            {
+                Contracts.ICodeVersions cv = _target.Contracts.CodeVersions;
+                NativeCodeVersionHandle ncvh = cv.GetNativeCodeVersionForIP(new TargetCodePointer(codeAddr));
+                if (!ncvh.Valid)
+                    return hr;
+                pCode = cv.GetNativeCode(ncvh);
+                if (pCode == TargetCodePointer.Null)
+                    return hr;
+            }
+            else
+            {
+                pCode = rts.GetNativeCode(md);
+                if (pCode == TargetCodePointer.Null)
+                    return hr;
+            }
+
+            IReadOnlyList<AsyncSuspensionInfo> suspensionPoints = _target.Contracts.DebugInfo.GetAsyncSuspensionPoints(pCode);
+            if ((int)state >= suspensionPoints.Count)
+                return hr;
+
+            IReadOnlyList<AsyncLocalInfo> locals = suspensionPoints[(int)state].Locals;
+            int varCount = locals.Count;
+            Helpers.AsyncLocalData* buffer =
+                Helpers.DacDbiArrayListMarshal.AllocAndAssign<Helpers.AsyncLocalData>(pAsyncLocals, varCount);
+            for (int i = 0; i < varCount; i++)
+            {
+                buffer[i].Offset = locals[i].Offset;
+                buffer[i].IlVarNum = locals[i].ILVarNumber;
+            }
+        }
+        catch (System.Exception ex)
+        {
+            hr = ex.HResult;
+        }
+#if DEBUG
+        if (_legacy is not null && hr == HResults.S_OK)
+        {
+            // Allocate a separate native buffer for the legacy result so we can compare.
+            // We deliberately leak this comparison buffer rather than try to dispatch the
+            // native DBI's delete[] from managed code; it is only allocated under DEBUG.
+            nuint structSize = (nuint)(sizeof(nint) + sizeof(int));
+            nint pLegacyList = (nint)NativeMemory.AllocZeroed(structSize);
+            try
+            {
+                int hrLocal = _legacy.GetAsyncLocals(vmMethod, codeAddr, state, pLegacyList);
+                Debug.ValidateHResult(hr, hrLocal);
+                if (hrLocal == HResults.S_OK)
+                {
+                    Helpers.AsyncLocalData* cdacBuf = *(Helpers.AsyncLocalData**)pAsyncLocals;
+                    int cdacCount = *(int*)((byte*)pAsyncLocals + sizeof(nint));
+                    Helpers.AsyncLocalData* legacyBuf = *(Helpers.AsyncLocalData**)pLegacyList;
+                    int legacyCount = *(int*)((byte*)pLegacyList + sizeof(nint));
+                    Debug.Assert(cdacCount == legacyCount, $"cDAC: {cdacCount} async locals, DAC: {legacyCount}");
+                    int n = cdacCount < legacyCount ? cdacCount : legacyCount;
+                    for (int i = 0; i < n; i++)
+                    {
+                        Debug.Assert(cdacBuf[i].Offset == legacyBuf[i].Offset, $"cDAC[{i}].Offset {cdacBuf[i].Offset} != DAC {legacyBuf[i].Offset}");
+                        Debug.Assert(cdacBuf[i].IlVarNum == legacyBuf[i].IlVarNum, $"cDAC[{i}].IlVarNum {cdacBuf[i].IlVarNum} != DAC {legacyBuf[i].IlVarNum}");
+                    }
+                }
+            }
+            finally
+            {
+                NativeMemory.Free((void*)pLegacyList);
+            }
+        }
+#endif
+        return hr;
+    }
 
     public int GetGenericArgTokenIndex(ulong vmMethod, uint* pIndex)
     {

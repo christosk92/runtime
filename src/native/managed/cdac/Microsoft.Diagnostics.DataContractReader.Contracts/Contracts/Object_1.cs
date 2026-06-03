@@ -175,4 +175,21 @@ internal readonly struct Object_1 : IObject
             TargetMethodPtr: targetMethodPtr,
             DelegateType: delegateType);
     }
+
+    public ContinuationInfo GetContinuationInfo(TargetPointer address)
+    {
+        Data.ContinuationObject cont = _target.ProcessedData.GetOrAdd<Data.ContinuationObject>(address);
+        return new ContinuationInfo(
+            Next: cont.Next,
+            ResumeInfo: cont.ResumeInfo,
+            State: (uint)cont.State);
+    }
+
+    public TargetPointer ReadResumeInfoDiagnosticIP(TargetPointer resumeInfo)
+    {
+        if (resumeInfo == TargetPointer.Null)
+            return TargetPointer.Null;
+        Data.AsyncResumeInfo info = _target.ProcessedData.GetOrAdd<Data.AsyncResumeInfo>(resumeInfo);
+        return info.DiagnosticIP;
+    }
 }

@@ -17,6 +17,11 @@ public readonly record struct DelegateInfo(
     TargetCodePointer TargetMethodPtr,
     DelegateType DelegateType);
 
+public readonly record struct ContinuationInfo(
+    TargetPointer Next,
+    TargetPointer ResumeInfo,
+    uint State);
+
 public interface IObject : IContract
 {
     static string IContract.Name { get; } = nameof(Object);
@@ -28,6 +33,10 @@ public interface IObject : IContract
     // Returns the SyncBlock address for the object, or TargetPointer.Null if no sync block is associated with it.
     TargetPointer GetSyncBlockAddress(TargetPointer address) => throw new NotImplementedException();
     DelegateInfo GetDelegateInfo(TargetPointer address) => throw new NotImplementedException();
+    ContinuationInfo GetContinuationInfo(TargetPointer address) => throw new NotImplementedException();
+    // Read the diagnostic IP out of the native ResumeInfo blob referenced by a continuation object.
+    // Returns TargetPointer.Null if the resume-info pointer itself is null.
+    TargetPointer ReadResumeInfoDiagnosticIP(TargetPointer resumeInfo) => throw new NotImplementedException();
 }
 
 public readonly struct Object : IObject

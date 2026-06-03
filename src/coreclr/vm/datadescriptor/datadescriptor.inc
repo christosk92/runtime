@@ -185,7 +185,19 @@ CDAC_TYPE_END(String)
 
 CDAC_TYPE_BEGIN(ContinuationObject)
 CDAC_TYPE_SIZE(sizeof(ContinuationObject))
+CDAC_TYPE_FIELD(ContinuationObject, T_POINTER, Next, cdac_data<ContinuationObject>::Next)
+CDAC_TYPE_FIELD(ContinuationObject, T_POINTER, ResumeInfo, cdac_data<ContinuationObject>::ResumeInfo)
+CDAC_TYPE_FIELD(ContinuationObject, T_INT32, State, cdac_data<ContinuationObject>::State)
 CDAC_TYPE_END(ContinuationObject)
+
+// AsyncResumeInfo mirrors the managed System.Runtime.CompilerServices.AsyncHelpers.ResumeInfo struct
+// (see AsyncHelpers.CoreCLR.cs). It is a managed value-type written into a native pinned/byref buffer,
+// so it has no native counterpart -- the offsets are derived from the managed layout: Resume (fn ptr)
+// followed by DiagnosticIP (void*).
+CDAC_TYPE_BEGIN(AsyncResumeInfo)
+CDAC_TYPE_SIZE(2 * TARGET_POINTER_SIZE)
+CDAC_TYPE_FIELD(AsyncResumeInfo, T_POINTER, DiagnosticIP, TARGET_POINTER_SIZE)
+CDAC_TYPE_END(AsyncResumeInfo)
 
 CDAC_TYPE_BEGIN(Array)
 CDAC_TYPE_SIZE(sizeof(ArrayBase))
