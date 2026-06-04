@@ -3857,22 +3857,15 @@ bool TryGetUnsignedNarrowMagic(
 
     // Smallest N is ceil(log2(d)); for N below that, magic = 1 and the result is
     // always 0 (incorrect when x >= d).
-    unsigned ceilLog2D = 0;
-    for (uint64_t t = d; t > 0; t >>= 1)
-    {
-        ceilLog2D++;
-    }
+    assert(d >= 2);
+    unsigned ceilLog2D = BitOperations::Log2(d - 1) + 1;
 
     // The largest N we ever need is ceilLog2D + bits(maxDividend); past that the
     // magic-up formula always works, but the magic grows and at some point the
     // product no longer fits in `productBits`. We also cap N below 64 to avoid
     // shifting by a value out of range for a 64-bit literal.
-    unsigned maxDividendBits = 0;
-    for (uint64_t t = maxDividend; t > 0; t >>= 1)
-    {
-        maxDividendBits++;
-    }
-    unsigned maxN = ceilLog2D + maxDividendBits;
+    unsigned maxDividendBits = BitOperations::Log2(maxDividend) + 1;
+    unsigned maxN            = ceilLog2D + maxDividendBits;
     if (maxN >= 64)
     {
         maxN = 63;
