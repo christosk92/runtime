@@ -8511,6 +8511,19 @@ bool Lowering::TryLowerConstIntDivOrMod(GenTree* node, GenTree** nextNode)
         return false;
     }
 
+    // If the divisor is positive and the dividend is known to be non-negative then the
+    // signed div/mod is equivalent to the unsigned one. Flip to GT_UDIV/GT_UMOD so the
+    // unsigned constant-divisor lowering (which includes the "narrow magic" path for
+    // small dividend ranges) can apply. Morph performs the same flip earlier, but by
+    // lowering we may know the dividend is non-negative via VN/assertion-prop info
+    // or new tree shapes produced by later optimization phases that morph could not see.
+    if (divisorValue > 0 && dividend->IsNeverNegative(m_compiler))
+    {
+        divMod->ChangeOper(divMod->OperIs(GT_DIV) ? GT_UDIV : GT_UMOD);
+        *nextNode = LowerUnsignedDivOrMod(divMod->AsOp());
+        return true;
+    }
+
     bool isDiv = divMod->OperIs(GT_DIV);
 
     if (isDiv)
