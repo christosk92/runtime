@@ -1113,6 +1113,20 @@ int32_t GetSigned32Magic(int32_t d, int* shift /*out*/);
 #ifdef TARGET_64BIT
 int64_t GetSigned64Magic(int64_t d, int* shift /*out*/);
 #endif
+
+// Try to compute a "narrow" magic number for unsigned division "x / d", suitable
+// for emitting a single multiply (whose product fits in `productBits` bits) followed
+// by a right shift. Returns true when such a magic is found.
+//
+// On success:
+//   (x * *magic) >> *shift == x / d   for all x in [0, maxDividend]
+// and maxDividend * *magic fits in productBits bits (so the multiplication does
+// not overflow a single `productBits`-wide register).
+bool TryGetUnsignedNarrowMagic(uint64_t  d,
+                               uint64_t  maxDividend,
+                               unsigned  productBits,
+                               uint64_t* magic /*out*/,
+                               unsigned* shift /*out*/);
 } // namespace MagicDivide
 
 //

@@ -3817,6 +3817,110 @@ uint64_t GetUnsigned64Magic(
 }
 #endif
 
+//------------------------------------------------------------------------
+// TryGetUnsignedNarrowMagic: Attempt to find a "narrow" magic for unsigned division
+//    "x / d" that is suitable for a single multiplication followed by a right shift,
+//    where the multiplication does not overflow a register of `productBits` bits.
+//
+// Arguments:
+//    d           - the divisor (must be >= 3 and not a power of 2)
+//    maxDividend - inclusive upper bound on the dividend x
+//    productBits - the number of bits available for the product (typically 32 or 64)
+//    magic       - [out] the magic multiplier
+//    shift       - [out] the right shift amount
+//
+// Return Value:
+//    true on success. When true, for all x in [0, maxDividend]:
+//        (x * *magic) >> *shift == x / d
+//    and maxDividend * *magic fits in `productBits` bits (i.e. it does not overflow
+//    a `productBits`-wide unsigned register).
+//
+// Notes:
+//    The search uses the standard "round-up" magic number formula
+//        magic = ceil(2^N / d)
+//    and finds the smallest N such that the magic is accurate for all dividends in
+//    range and the product does not overflow. When this is possible the JIT can emit
+//    a single MUL/IMUL of the dividend by the magic into a `productBits`-wide
+//    register followed by a right shift, avoiding the wider MULHI sequence that
+//    would otherwise be required.
+//
+bool TryGetUnsignedNarrowMagic(
+    uint64_t d, uint64_t maxDividend, unsigned productBits, uint64_t* magic /*out*/, unsigned* shift /*out*/)
+{
+    assert((d >= 3) && !isPow2(d));
+    assert(productBits == 32 || productBits == 64);
+
+    if (maxDividend == 0)
+    {
+        return false;
+    }
+
+    // Smallest N is ceil(log2(d)); for N below that, magic = 1 and the result is
+    // always 0 (incorrect when x >= d).
+    unsigned ceilLog2D = 0;
+    for (uint64_t t = d; t > 0; t >>= 1)
+    {
+        ceilLog2D++;
+    }
+
+    // The largest N we ever need is ceilLog2D + bits(maxDividend); past that the
+    // magic-up formula always works, but the magic grows and at some point the
+    // product no longer fits in `productBits`. We also cap N below 64 to avoid
+    // shifting by a value out of range for a 64-bit literal.
+    unsigned maxDividendBits = 0;
+    for (uint64_t t = maxDividend; t > 0; t >>= 1)
+    {
+        maxDividendBits++;
+    }
+    unsigned maxN = ceilLog2D + maxDividendBits;
+    if (maxN >= 64)
+    {
+        maxN = 63;
+    }
+
+    for (unsigned N = ceilLog2D; N <= maxN; N++)
+    {
+        uint64_t pow2N = 1ULL << N;
+        uint64_t rem   = pow2N % d;
+        // r = d - (2^N mod d), with r = 0 if d divides 2^N (then magic is exact).
+        uint64_t r = (rem == 0) ? 0 : (d - rem);
+
+        // Accuracy: maxDividend * r < 2^N must hold for the round-up magic to be
+        // exact for all x in [0, maxDividend]. Compare without risking overflow.
+        if (r != 0 && r > (pow2N - 1) / maxDividend)
+        {
+            continue;
+        }
+
+        // Compute magic = ceil(2^N / d).
+        uint64_t m = (pow2N + d - 1) / d;
+
+        // Product non-overflow: maxDividend * m must fit in productBits.
+        if (productBits < 64)
+        {
+            uint64_t productLimit = 1ULL << productBits;
+            if (m > (productLimit - 1) / maxDividend)
+            {
+                continue;
+            }
+        }
+        else
+        {
+            // productBits == 64: detect overflow via division.
+            if (m > UINT64_MAX / maxDividend)
+            {
+                continue;
+            }
+        }
+
+        *magic = m;
+        *shift = N;
+        return true;
+    }
+
+    return false;
+}
+
 template <typename T>
 struct SignedMagic
 {

@@ -8187,18 +8187,25 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
         bool   simpleMul = false;
 
         unsigned bits = type == TYP_INT ? 32 : 64;
+
+        // Reduce 'bits' to the smallest known upper bound on the number of significant
+        // bits in the dividend. A smaller 'bits' lets MagicDivide pick a smaller magic
+        // (and a smaller post-shift), and may enable the "narrow magic" path below.
+        auto reduceBits = [&bits](uint64_t maxValue) {
+            if (maxValue != 0)
+            {
+                unsigned valueBits = BitOperations::Log2(maxValue) + 1;
+                if (valueBits < bits)
+                {
+                    bits = valueBits;
+                }
+            }
+        };
+
         // if the dividend operand is AND or RSZ with a constant then the number of input bits can be reduced
         if (dividend->OperIs(GT_AND) && dividend->gtGetOp2()->IsCnsIntOrI())
         {
-            size_t maskCns = static_cast<size_t>(dividend->gtGetOp2()->AsIntCon()->IconValue());
-            if (maskCns != 0)
-            {
-                unsigned maskBits = 1;
-                while (maskCns >>= 1)
-                    maskBits++;
-                if (maskBits < bits)
-                    bits = maskBits;
-            }
+            reduceBits(static_cast<uint64_t>(dividend->gtGetOp2()->AsIntCon()->IconValue()));
         }
         else if (dividend->OperIs(GT_RSZ) && dividend->gtGetOp2()->IsCnsIntOrI())
         {
@@ -8209,39 +8216,82 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
             }
         }
 
+        // Additionally, consult the dividend's known integral range. This catches cases
+        // such as a dividend produced by a cast from a smaller unsigned type
+        // (e.g. "(uint)(ushort)x / 10"), where the upper bits are known to be zero.
+        IntegralRange dividendRange = IntegralRange::ForNode(dividend, m_compiler);
+        if (dividendRange.IsNonNegative())
+        {
+            reduceBits(static_cast<uint64_t>(IntegralRange::SymbolicToRealValue(dividendRange.GetUpperBound())));
+        }
+
+        // Try the "narrow magic" path: when the dividend's range is small enough that
+        // the product (dividend * magic) fits in a single `type`-sized register, we can
+        // emit a non-widened MUL followed by a small RSZ instead of a widened MULHI.
+        // For example, on x64 "(uint)(ushort)x / 10" becomes
+        //     imul eax, ecx, 0xCCCD
+        //     shr  eax, 19
+        // instead of the wider
+        //     mov  ecx, 0xCCCCCCCD
+        //     imul rax, rcx
+        //     shr  rax, 35
+        // This shares the rest of the lowering with the regular magic-divide path by
+        // setting simpleMul/narrowMul and re-using the GT_MUL emission below.
+        bool narrowMul = false;
         if (type == TYP_INT)
         {
-            magic = MagicDivide::GetUnsigned32Magic(static_cast<uint32_t>(divisorValue), &increment, &preShift,
-                                                    &postShift, bits);
+            uint64_t maxDividend = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
+            uint64_t narrowMagic = 0;
+            unsigned narrowShift = 0;
+
+            if (MagicDivide::TryGetUnsignedNarrowMagic(static_cast<uint64_t>(divisorValue), maxDividend,
+                                                       /* productBits */ 32, &narrowMagic, &narrowShift))
+            {
+                magic     = static_cast<size_t>(narrowMagic);
+                increment = false;
+                preShift  = 0;
+                postShift = static_cast<int>(narrowShift);
+                simpleMul = true;
+                narrowMul = true;
+            }
+        }
+
+        if (!narrowMul)
+        {
+            if (type == TYP_INT)
+            {
+                magic = MagicDivide::GetUnsigned32Magic(static_cast<uint32_t>(divisorValue), &increment, &preShift,
+                                                        &postShift, bits);
 
 #ifdef TARGET_64BIT
-            // avoid inc_saturate/multiple shifts by widening to 32x64 MULHI
-            if (increment || (preShift
+                // avoid inc_saturate/multiple shifts by widening to 32x64 MULHI
+                if (increment || (preShift
 #ifdef TARGET_XARCH
-                              // IMUL reg,reg,imm32 can't be used if magic<0 because of sign-extension
-                              && static_cast<int32_t>(magic) < 0
+                                  // IMUL reg,reg,imm32 can't be used if magic<0 because of sign-extension
+                                  && static_cast<int32_t>(magic) < 0
 #endif
-                              ))
-            {
-                magic = MagicDivide::GetUnsigned64Magic(static_cast<uint64_t>(divisorValue), &increment, &preShift,
-                                                        &postShift, bits);
+                                  ))
+                {
+                    magic = MagicDivide::GetUnsigned64Magic(static_cast<uint64_t>(divisorValue), &increment, &preShift,
+                                                            &postShift, bits);
+                }
+                // otherwise just widen to regular multiplication
+                else
+                {
+                    postShift += 32;
+                    simpleMul = true;
+                }
+#endif
             }
-            // otherwise just widen to regular multiplication
             else
             {
-                postShift += 32;
-                simpleMul = true;
-            }
-#endif
-        }
-        else
-        {
 #ifdef TARGET_64BIT
-            magic = MagicDivide::GetUnsigned64Magic(static_cast<uint64_t>(divisorValue), &increment, &preShift,
-                                                    &postShift, bits);
+                magic = MagicDivide::GetUnsigned64Magic(static_cast<uint64_t>(divisorValue), &increment, &preShift,
+                                                        &postShift, bits);
 #else
-            unreached();
+                unreached();
 #endif
+            }
         }
 
         const bool     requiresDividendMultiuse = !isDiv;
@@ -8256,11 +8306,17 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
         GenTree* firstNode        = nullptr;
         GenTree* adjustedDividend = dividend;
 
+        // For the "narrow magic" path the multiplication stays at the original (small)
+        // type so we never widen the operands. Otherwise the multiplication is widened
+        // to TYP_I_IMPL (and on ARM64 the 32x32->64 simpleMul variant is also kept
+        // narrow on the operands but produces a wider result via GT_MUL_LONG).
+        const var_types mulType = narrowMul ? type : TYP_I_IMPL;
+
 #if defined(TARGET_ARM64)
         // On ARM64 we will use a 32x32->64 bit multiply instead of a 64x64->64 one.
         bool widenToNativeIntForMul = (type != TYP_I_IMPL) && !simpleMul;
 #else
-        bool widenToNativeIntForMul = (type != TYP_I_IMPL);
+        bool widenToNativeIntForMul = (type != TYP_I_IMPL) && !narrowMul;
 #endif
 
         // If "increment" flag is returned by GetUnsignedMagic we need to do Saturating Increment first
@@ -8302,7 +8358,7 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
         }
         divisor->AsIntCon()->SetIconValue(magic);
 
-        if (isDiv && !postShift && (type == TYP_I_IMPL))
+        if (isDiv && !postShift && (type == mulType))
         {
             divMod->ChangeOper(GT_MULHI);
             divMod->gtOp1 = adjustedDividend;
@@ -8311,17 +8367,19 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
         else
         {
 #ifdef TARGET_ARM64
-            // 64-bit MUL is more expensive than UMULL on ARM64.
-            genTreeOps mulOper = simpleMul ? GT_MUL_LONG : GT_MULHI;
+            // 64-bit MUL is more expensive than UMULL on ARM64. For the narrow magic
+            // path we want a true narrow (32x32->32) MUL instead of UMULL's widening.
+            genTreeOps mulOper = narrowMul ? GT_MUL : (simpleMul ? GT_MUL_LONG : GT_MULHI);
 #else
             // 64-bit IMUL is less expensive than MUL eax:edx on x64.
+            // The narrow magic path uses a non-widened MUL that keeps the low bits.
             genTreeOps mulOper = simpleMul ? GT_MUL : GT_MULHI;
 #endif
             // Insert a new multiplication node before the existing GT_UDIV/GT_UMOD node.
             // The existing node will later be transformed into a GT_RSZ/GT_SUB that
             // computes the final result. This way don't need to find and change the use
             // of the existing node.
-            GenTree* mulhi = m_compiler->gtNewOperNode(mulOper, TYP_I_IMPL, adjustedDividend, divisor);
+            GenTree* mulhi = m_compiler->gtNewOperNode(mulOper, mulType, adjustedDividend, divisor);
             mulhi->SetUnsigned();
             BlockRange().InsertBefore(divMod, mulhi);
             if (firstNode == nullptr)
@@ -8334,7 +8392,7 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
                 GenTree* shiftBy = m_compiler->gtNewIconNode(postShift, TYP_INT);
                 BlockRange().InsertBefore(divMod, shiftBy);
 
-                if (isDiv && (type == TYP_I_IMPL))
+                if (isDiv && (type == mulType))
                 {
                     divMod->ChangeOper(GT_RSZ);
                     divMod->gtOp1 = mulhi;
@@ -8342,7 +8400,7 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
                 }
                 else
                 {
-                    mulhi = m_compiler->gtNewOperNode(GT_RSZ, TYP_I_IMPL, mulhi, shiftBy);
+                    mulhi = m_compiler->gtNewOperNode(GT_RSZ, mulType, mulhi, shiftBy);
                     BlockRange().InsertBefore(divMod, mulhi);
                 }
             }
@@ -8360,7 +8418,7 @@ bool Lowering::TryLowerConstIntUDivOrUMod(GenTreeOp* divMod)
 
                 BlockRange().InsertBefore(divMod, divisor, mul, dividend);
             }
-            else if (type != TYP_I_IMPL)
+            else if (type != mulType)
             {
                 divMod->ChangeOper(GT_CAST);
                 divMod->AsCast()->gtCastType = TYP_INT;
