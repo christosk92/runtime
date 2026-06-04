@@ -92,6 +92,23 @@ public struct DacDbiExceptionCallStackData
     public Interop.BOOL isLastForeignExceptionFrame;
 }
 
+/// <summary>
+/// Managed mirror of native <c>AsyncLocalData</c> from src/coreclr/debug/inc/dacdbistructures.h.
+/// Maps the offset of an async variable within a continuation to its IL variable number.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct AsyncLocalData : IEquatable<AsyncLocalData>
+{
+    /// <summary>Offset within a continuation object where the variable is stored.</summary>
+    public uint Offset;
+    /// <summary>IL variable number corresponding to the async local.</summary>
+    public uint IlVarNum;
+
+    public bool Equals(AsyncLocalData other) => Offset == other.Offset && IlVarNum == other.IlVarNum;
+    public override bool Equals(object? obj) => obj is AsyncLocalData o && Equals(o);
+    public override int GetHashCode() => HashCode.Combine(Offset, IlVarNum);
+}
+
 [StructLayout(LayoutKind.Sequential)]
 public struct COR_HEAPINFO
 {
@@ -724,7 +741,8 @@ public unsafe partial interface IDacDbiInterface
     int ParseContinuation(ulong continuationAddress, ulong* pDiagnosticIP, ulong* pNextContinuation, uint* pState);
 
     [PreserveSig]
-    int GetAsyncLocals(ulong vmMethod, ulong codeAddr, uint state, nint pAsyncLocals);
+    int EnumerateAsyncLocals(ulong vmMethod, ulong codeAddr, uint state,
+        delegate* unmanaged<AsyncLocalData*, nint, void> fpCallback, nint pUserData);
 
     [PreserveSig]
     int GetGenericArgTokenIndex(ulong vmMethod, uint* pIndex);

@@ -4106,25 +4106,38 @@ public sealed unsafe partial class DacDbiImpl : IDacDbiInterface
         return hr;
     }
 
-    public int GetAsyncLocals(ulong vmMethod, ulong codeAddr, uint state, nint pAsyncLocals)
+#if DEBUG
+    [ThreadStatic]
+    private static List<AsyncLocalData>? _debugEnumerateAsyncLocals;
+
+    private static List<AsyncLocalData> DebugEnumerateAsyncLocals
+        => _debugEnumerateAsyncLocals ??= new();
+
+    [UnmanagedCallersOnly]
+    private static void EnumerateAsyncLocalsDebugCallback(AsyncLocalData* pLocal, nint _)
+    {
+        DebugEnumerateAsyncLocals.Add(*pLocal);
+    }
+#endif
+
+    public int EnumerateAsyncLocals(ulong vmMethod, ulong codeAddr, uint state,
+        delegate* unmanaged<AsyncLocalData*, nint, void> fpCallback, nint pUserData)
     {
         int hr = HResults.S_OK;
+        List<AsyncLocalData> locals = new();
         try
         {
             if (vmMethod == 0)
                 throw new ArgumentException("vmMethod must not be zero.", nameof(vmMethod));
-            if (pAsyncLocals == 0)
-                throw new ArgumentException("pAsyncLocals must not be null.", nameof(pAsyncLocals));
+            if (fpCallback is null)
+                throw new ArgumentNullException(nameof(fpCallback));
 
             Contracts.IRuntimeTypeSystem rts = _target.Contracts.RuntimeTypeSystem;
             Contracts.MethodDescHandle md = rts.GetMethodDescHandle(new TargetPointer(vmMethod));
 
-            // Initialize the output list to empty up front so that early returns leave it well-defined.
-            Helpers.DacDbiArrayListMarshal.AllocAndAssign<Helpers.AsyncLocalData>(pAsyncLocals, 0);
-
             // Mirrors native: async thunks do not have async debug info on the thunk itself.
             if (rts.IsAsyncThunkMethod(md))
-                return hr;
+                goto Done;
 
             TargetCodePointer pCode;
             if (codeAddr != 0)
@@ -4132,67 +4145,64 @@ public sealed unsafe partial class DacDbiImpl : IDacDbiInterface
                 Contracts.ICodeVersions cv = _target.Contracts.CodeVersions;
                 NativeCodeVersionHandle ncvh = cv.GetNativeCodeVersionForIP(new TargetCodePointer(codeAddr));
                 if (!ncvh.Valid)
-                    return hr;
+                    goto Done;
                 pCode = cv.GetNativeCode(ncvh);
                 if (pCode == TargetCodePointer.Null)
-                    return hr;
+                    goto Done;
             }
             else
             {
                 pCode = rts.GetNativeCode(md);
                 if (pCode == TargetCodePointer.Null)
-                    return hr;
+                    goto Done;
             }
 
             IReadOnlyList<AsyncSuspensionInfo> suspensionPoints = _target.Contracts.DebugInfo.GetAsyncSuspensionPoints(pCode);
             if ((int)state >= suspensionPoints.Count)
-                return hr;
+                goto Done;
 
-            IReadOnlyList<AsyncLocalInfo> locals = suspensionPoints[(int)state].Locals;
-            int varCount = locals.Count;
-            Helpers.AsyncLocalData* buffer =
-                Helpers.DacDbiArrayListMarshal.AllocAndAssign<Helpers.AsyncLocalData>(pAsyncLocals, varCount);
+            IReadOnlyList<AsyncLocalInfo> localInfos = suspensionPoints[(int)state].Locals;
+            int varCount = localInfos.Count;
             for (int i = 0; i < varCount; i++)
             {
-                buffer[i].Offset = locals[i].Offset;
-                buffer[i].IlVarNum = locals[i].ILVarNumber;
+                AsyncLocalData local = new()
+                {
+                    Offset = localInfos[i].Offset,
+                    IlVarNum = localInfos[i].ILVarNumber,
+                };
+                locals.Add(local);
+                fpCallback(&local, pUserData);
             }
+        Done: ;
         }
         catch (System.Exception ex)
         {
             hr = ex.HResult;
         }
+
 #if DEBUG
-        if (_legacy is not null && hr == HResults.S_OK)
+        if (_legacy is not null)
         {
-            // Allocate a separate native buffer for the legacy result so we can compare.
-            // We deliberately leak this comparison buffer rather than try to dispatch the
-            // native DBI's delete[] from managed code; it is only allocated under DEBUG.
-            nuint structSize = (nuint)(sizeof(nint) + sizeof(int));
-            nint pLegacyList = (nint)NativeMemory.AllocZeroed(structSize);
-            try
+            DebugEnumerateAsyncLocals.Clear();
+            delegate* unmanaged<AsyncLocalData*, nint, void> debugCallbackPtr = &EnumerateAsyncLocalsDebugCallback;
+            int hrLocal = _legacy.EnumerateAsyncLocals(vmMethod, codeAddr, state, debugCallbackPtr, 0);
+            Debug.ValidateHResult(hr, hrLocal);
+
+            if (hr == HResults.S_OK)
             {
-                int hrLocal = _legacy.GetAsyncLocals(vmMethod, codeAddr, state, pLegacyList);
-                Debug.ValidateHResult(hr, hrLocal);
-                if (hrLocal == HResults.S_OK)
+                List<AsyncLocalData> legacyLocals = DebugEnumerateAsyncLocals;
+                Debug.Assert(locals.Count == legacyLocals.Count,
+                    $"cDAC: {locals.Count} async locals, DAC: {legacyLocals.Count}");
+                int n = Math.Min(locals.Count, legacyLocals.Count);
+                for (int i = 0; i < n; i++)
                 {
-                    Helpers.AsyncLocalData* cdacBuf = *(Helpers.AsyncLocalData**)pAsyncLocals;
-                    int cdacCount = *(int*)((byte*)pAsyncLocals + sizeof(nint));
-                    Helpers.AsyncLocalData* legacyBuf = *(Helpers.AsyncLocalData**)pLegacyList;
-                    int legacyCount = *(int*)((byte*)pLegacyList + sizeof(nint));
-                    Debug.Assert(cdacCount == legacyCount, $"cDAC: {cdacCount} async locals, DAC: {legacyCount}");
-                    int n = cdacCount < legacyCount ? cdacCount : legacyCount;
-                    for (int i = 0; i < n; i++)
-                    {
-                        Debug.Assert(cdacBuf[i].Offset == legacyBuf[i].Offset, $"cDAC[{i}].Offset {cdacBuf[i].Offset} != DAC {legacyBuf[i].Offset}");
-                        Debug.Assert(cdacBuf[i].IlVarNum == legacyBuf[i].IlVarNum, $"cDAC[{i}].IlVarNum {cdacBuf[i].IlVarNum} != DAC {legacyBuf[i].IlVarNum}");
-                    }
+                    Debug.Assert(locals[i].Offset == legacyLocals[i].Offset,
+                        $"cDAC[{i}].Offset {locals[i].Offset} != DAC {legacyLocals[i].Offset}");
+                    Debug.Assert(locals[i].IlVarNum == legacyLocals[i].IlVarNum,
+                        $"cDAC[{i}].IlVarNum {locals[i].IlVarNum} != DAC {legacyLocals[i].IlVarNum}");
                 }
             }
-            finally
-            {
-                NativeMemory.Free((void*)pLegacyList);
-            }
+            DebugEnumerateAsyncLocals.Clear();
         }
 #endif
         return hr;
